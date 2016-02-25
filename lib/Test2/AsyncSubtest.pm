@@ -22,7 +22,7 @@ use Test2::Util::HashBase qw{
     stack
     id
     _in_use
-    _attached
+    _attached pid tid
 };
 
 my @STACK;
@@ -39,6 +39,8 @@ sub init {
     $self->{+STACK} = [@STACK];
     $_->{+_IN_USE}++ for reverse @STACK;
 
+    $self->{+TID}       = get_tid;
+    $self->{+PID}       = $$;
     $self->{+ID}        = 1;
     $self->{+FINISHED}  = 0;
     $self->{+ACTIVE}    = 0;
@@ -268,10 +270,11 @@ sub finish {
 sub DESTROY {
     my $self = shift;
     return if $self->{+FINISHED};
-    return unless $self->{+HUB};
-    return unless $self->{+HUB}->is_local;
+    return unless $self->{+PID} == $$;
+    return unless $self->{+TID} == get_tid;
 
-    eval { $_->{+_IN_USE}-- } for reverse @{$self->{+STACK}};
+    local $@;
+    eval { $_->{+_IN_USE}-- for reverse @{$self->{+STACK}} };
 
     warn "Subtest $self->{+NAME} did not finish!";
     exit 255;
