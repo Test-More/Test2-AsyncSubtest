@@ -2,12 +2,17 @@ package Test2::AsyncSubtest;
 use strict;
 use warnings;
 
-use Carp qw/croak/;
-use Test2::Util qw/get_tid/;
+use Test2::IPC;
 
+use Carp qw/croak cluck/;
+use Test2::Util qw/get_tid CAN_THREAD CAN_FORK/;
+use Scalar::Util qw/blessed/;
+
+use Scope::Guard();
 use Test2::API();
-use Test2::Util::Trace();
 use Test2::API::Context();
+use Test2::Util::Trace();
+use Time::HiRes();
 
 use Test2::AsyncSubtest::Hub();
 use Test2::AsyncSubtest::Event::Attach();
@@ -21,6 +26,7 @@ use Test2::Util::HashBase qw{
     active
     stack
     id
+    children
     _in_use
     _attached pid tid
 };
@@ -33,8 +39,16 @@ sub init {
     croak "'name' is a required attribute"
         unless $self->{+NAME};
 
-    $self->{+SEND_TO} ||= Test2::API::test2_stack()->top;
-    $self->{+TRACE}   ||= Test2::Util::Trace->new(frame => [caller(1)]);
+    if (delete $self->{context}) {
+        my $ctx = Test2::API::context();
+        $self->{+SEND_TO} ||= $ctx->hub;
+        $self->{+TRACE}   ||= $ctx->trace;
+        $ctx->release;
+    }
+    else {
+        $self->{+SEND_TO} ||= Test2::API::test2_stack()->top;
+        $self->{+TRACE}   ||= Test2::Util::Trace->new(frame => [caller(1)]);
+    }
 
     $self->{+STACK} = [@STACK];
     $_->{+_IN_USE}++ for reverse @STACK;
@@ -45,6 +59,7 @@ sub init {
     $self->{+FINISHED}  = 0;
     $self->{+ACTIVE}    = 0;
     $self->{+_IN_USE}   = 0;
+    $self->{+CHILDREN}  = [];
 
     unless($self->{+HUB}) {
         my $ipc = Test2::API::test2_ipc();
@@ -109,25 +124,30 @@ sub attach {
     croak "You must attach INSIDE the child process/thread"
         if $self->{+HUB}->is_local;
 
-    $self->{+_ATTACHED} = [ $$, get_tid ];
+    $self->{+_ATTACHED} = [ $$, get_tid, $id ];
     $self->{+HUB}->send($self->_gen_event('Attach', $id));
 }
 
 sub detach {
     my $self = shift;
-    my ($id) = @_;
-
-    croak "An ID is required" unless $id;
-
-    croak "ID $id is not valid"
-        unless defined $self->{+HUB}->ast_ids->{$id};
 
     croak "You must detach INSIDE the child process/thread"
-        if $self->{+HUB}->is_local;
+        if $self->{+PID} == $$ && $self->{+TID} == get_tid;
+
+    my $att = $self->{+_ATTACHED}
+        or croak "Not attached";
+
+    croak "Attempt to detach from wrong child"
+        unless $att->[0] == $$ && $att->[1] == get_tid;
+
+    my $id = $att->[2];
 
     $self->{+HUB}->send($self->_gen_event('Detach', $id));
+
+    delete $self->{+_ATTACHED};
 }
 
+sub ready { return !shift->pending }
 sub pending {
     my $self = shift;
     my $hub = $self->{+HUB};
@@ -233,10 +253,9 @@ sub finish {
     croak "Subtest is still active"
         if $self->{+ACTIVE};
 
-    croak "Subtest still has pending items"
-        if $self->pending;
+    $self->wait;
 
-    $hub->finalize(Test2::Util::Trace->new(frame => [caller(0)]), 1)
+    $hub->finalize($self->trace, 1)
         unless $hub->no_ending || $hub->ended;
 
     if ($hub->ipc) {
@@ -267,8 +286,123 @@ sub finish {
     return $e->pass;
 }
 
+sub wait {
+    my $self = shift;
+
+    my $hub = $self->{+HUB};
+    my $children = $self->{+CHILDREN};
+
+    while ($self->pending || @$children) {
+        $hub->cull;
+        if (my $child = pop @$children) {
+            if (blessed($child)) {
+                $child->join;
+            }
+            else {
+                waitpid($child, 0);
+            }
+        }
+        else {
+            Time::HiRes::sleep('0.01');
+        }
+    }
+
+    $hub->cull;
+}
+
+sub fork {
+    croak "Forking is not supported" unless CAN_FORK;
+    my $self = shift;
+    my $id = $self->split;
+    my $pid = CORE::fork();
+
+    unless (defined $pid) {
+        delete $self->{+HUB}->ast_ids->{$id};
+        croak "Failed to fork";
+    }
+
+    if($pid) {
+        push @{$self->{+CHILDREN}} => $pid;
+        return $pid;
+    }
+
+    $self->attach($id);
+
+    return $self->_guard;
+}
+
+sub run_fork {
+    my $self = shift;
+    my ($code, @args) = @_;
+
+    my $f = $self->fork;
+    return $f unless blessed($f);
+
+    $self->run($code, @args);
+
+    $self->detach();
+    $f->dismiss();
+    exit 0;
+}
+
+sub run_thread {
+    croak "Threading is not supported" unless CAN_THREAD;
+    require threads;
+
+    my $self = shift;
+    my ($code, @args) = @_;
+
+    my $id = $self->split;
+    my $thr =  threads->create(sub {
+        $self->attach($id);
+        my $guard = $self->_guard();
+
+        $self->run($code, @args);
+
+        $self->detach();
+        $guard->dismiss;
+        return 0;
+    });
+
+    push @{$self->{+CHILDREN}} => $thr;
+
+    return $thr;
+}
+
+sub _guard {
+    my $self = shift;
+
+    my ($pid, $tid) = ($$, get_tid);
+
+    return Scope::Guard->new(sub {
+        return unless $$ == $pid && get_tid == $tid;
+
+        my $error = "Scope Leak";
+        if (my $ex = $@) {
+            chomp($ex);
+            $error .= " ($ex)";
+        }
+
+        cluck $error;
+
+        my $e = $self->context->build_event(
+            'Exception',
+            error => "$error\n",
+        );
+        $self->{+HUB}->send($e);
+        $self->detach();
+        exit 255;
+    });
+}
+
 sub DESTROY {
     my $self = shift;
+
+    if (my $att = $self->{+_ATTACHED}) {
+        return unless $self->{+HUB};
+        eval { $self->detach() };
+    }
+
     return if $self->{+FINISHED};
     return unless $self->{+PID} == $$;
     return unless $self->{+TID} == get_tid;

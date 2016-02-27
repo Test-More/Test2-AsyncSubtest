@@ -35,7 +35,7 @@ if (CAN_REALLY_FORK) {
 
             ok(1, "from proc $$");
 
-            $_->detach($id);
+            $_->detach();
 
             1
         };
@@ -49,7 +49,7 @@ if (CAN_REALLY_FORK) {
 
 ok(1, "Something else");
 
-if (CAN_THREAD) {
+if (0 && CAN_THREAD) {
     require threads;
     my @threads;
 
@@ -58,7 +58,7 @@ if (CAN_THREAD) {
         push @threads => threads->create(sub {
             $_->attach($id);
             ok(1, "from thread " . get_tid);
-            $_->detach($id);
+            $_->detach();
         });
     }) for $t1, $t2;
 
