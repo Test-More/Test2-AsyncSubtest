@@ -75,6 +75,23 @@ other events are also being generated.
     use Test2::Bundle::Extended;
     use Test2::Tools::AsyncSubtest;
 
+    my $ast1 = async_subtest local => sub {
+        ok(1, "Inside subtest");
+    };
+
+    my $ast2 = fork_subtest child => sub {
+        ok(1, "Inside subtest in another process");
+    };
+
+    my $ast3 = thread_subtest thread => sub {
+        ok(1, "Inside subtest in a thread");
+    };
+
+    # You must call finish on the subtests you create. Finish will wait/join on
+    # any child processes and threads.
+    $ast1->finish;
+    $ast2->finish;
+    $ast3->finish;
 
     done_testing;
 
@@ -88,12 +105,15 @@ Everything is exported by default.
 
 =item $ast = async_subtest $name => sub { ... }
 
+Create an async subtest. Run the codeblock if it is provided.
 
 =item $ast = fork_subtest $name => sub { ... }
 
+Create an async subtest. Run the codeblock in a forked process.
 
 =item $ast = thread_subtest $name => sub { ... }
 
+Create an async subtest. Run the codeblock in a thread.
 
 =back
 

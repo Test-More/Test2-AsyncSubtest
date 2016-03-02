@@ -49,7 +49,7 @@ is(
                 event '+Test2::AsyncSubtest::Event::Detach' => {};
                 event Plan => { max => 1 };
             };
-        } for 1 .. 2;
+        } for grep { $_ } CAN_REALLY_FORK, CAN_THREAD;
     },
     "Got expected events"
 );

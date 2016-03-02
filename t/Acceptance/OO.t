@@ -22,7 +22,7 @@ if (CAN_REALLY_FORK) {
     my @pids;
 
     $_->run(sub {
-        my $id = $_->split;
+        my $id = $_->cleave;
         my $pid = fork;
         die "Failed to fork!" unless defined $pid;
         if ($pid) {
@@ -54,7 +54,7 @@ if (0 && CAN_THREAD) {
     my @threads;
 
     $_->run(sub {
-        my $id = $_->split;
+        my $id = $_->cleave;
         push @threads => threads->create(sub {
             $_->attach($id);
             ok(1, "from thread " . get_tid);

@@ -4,6 +4,10 @@ use warnings;
 
 use Test2::IPC;
 
+our $VERSION = '0.000002';
+
+our @CARP_NOT = qw/Test2::Util::HashBase/;
+
 use Carp qw/croak cluck/;
 use Test2::Util qw/get_tid CAN_THREAD CAN_FORK/;
 use Scalar::Util qw/blessed/;
@@ -39,16 +43,8 @@ sub init {
     croak "'name' is a required attribute"
         unless $self->{+NAME};
 
-    if (delete $self->{context}) {
-        my $ctx = Test2::API::context();
-        $self->{+SEND_TO} ||= $ctx->hub;
-        $self->{+TRACE}   ||= $ctx->trace;
-        $ctx->release;
-    }
-    else {
-        $self->{+SEND_TO} ||= Test2::API::test2_stack()->top;
-        $self->{+TRACE}   ||= Test2::Util::Trace->new(frame => [caller(1)]);
-    }
+    $self->{+SEND_TO} ||= Test2::API::test2_stack()->top;
+    $self->{+TRACE}   ||= Test2::Util::Trace->new(frame => [caller(1)]);
 
     $self->{+STACK} = [@STACK];
     $_->{+_IN_USE}++ for reverse @STACK;
@@ -68,11 +64,23 @@ sub init {
     }
 
     my $hub = $self->{+HUB};
-    $hub->set_ast_ids({});
-    my @events;
-    $hub->listen(sub { push @events => $_[1] });
+    $hub->set_ast_ids({}) unless $hub->ast_ids;
+    $hub->listen($self->_listener);
+    $hub->pre_filter($self->_pre_filter);
+}
 
-    $hub->pre_filter(sub {
+sub _listener {
+    my $self = shift;
+
+    my $events = $self->{+EVENTS} ||= [];
+
+    sub { push @$events => $_[1] };
+}
+
+sub _pre_filter {
+    my $self = shift;
+
+    sub {
         my ($hub, $e) = @_;
         return $e if $hub->is_local;
 
@@ -80,9 +88,7 @@ sub init {
         return $e if $attached && @$attached && $attached->[0] == $$ && $attached->[1] == get_tid;
         $e->trace->throw("You must attach to an AsyncSubtest before you can send events to it from another process or thread");
         return;
-    });
-
-    $self->{+EVENTS} = \@events;
+    };
 }
 
 sub context {
@@ -102,7 +108,7 @@ sub _gen_event {
     return $class->new(id => $id, trace => Test2::Util::Trace->new(frame => [caller(1)]));
 }
 
-sub split {
+sub cleave {
     my $self = shift;
     my $id = $self->{+ID}++;
     $self->{+HUB}->ast_ids->{$id} = 0;
@@ -313,7 +319,7 @@ sub wait {
 sub fork {
     croak "Forking is not supported" unless CAN_FORK;
     my $self = shift;
-    my $id = $self->split;
+    my $id = $self->cleave;
     my $pid = CORE::fork();
 
     unless (defined $pid) {
@@ -352,7 +358,7 @@ sub run_thread {
     my $self = shift;
     my ($code, @args) = @_;
 
-    my $id = $self->split;
+    my $id = $self->cleave;
     my $thr =  threads->create(sub {
         $self->attach($id);
         my $guard = $self->_guard();
@@ -397,6 +403,7 @@ sub _guard {
 
 sub DESTROY {
     my $self = shift;
+    return unless $self->{+NAME};
 
     if (my $att = $self->{+_ATTACHED}) {
         return unless $self->{+HUB};
@@ -417,3 +424,263 @@ sub DESTROY {
 1;
 
 __END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::AsyncSubtest - Object representing an async subtest.
+
+=head1 DESCRIPTION
+
+Regular subtests have a limited scope, they start, events are generated, then
+they close and send an L<Test2::Event::Subtest> event. This is a problem if you
+want the subtest to keep recieving events while other events are also being
+generated. This class implements subtests that stay pen until you decide to
+close them.
+
+This is mainly useful for tools that start a subtest in one process or thread
+and then spawn children. In many cases it is nice to let the parent process
+continue instead of waiting on the children.
+
+=head1 SYNOPSYS
+
+    use Test2::AsyncSubtest;
+
+    my $ast = Test2::AsyncSubtest->new(name => foo);
+
+    $ast->run(sub {
+        ok(1, "Event in parent" );
+    });
+
+    ok(1, "Event outside of subtest");
+
+    $ast->run_fork(sub {
+        ok(1, "Event in child process");
+    });
+
+    $ast->run_thread(sub {
+        ok(1, "Event in child thread");
+    });
+
+    ...
+
+    $ast->finish;
+
+    done_testing;
+
+=head1 CONSTRUCTION
+
+    my $ast = Test2::AsyncSubtest->new( ... );
+
+=over 4
+
+=item name => $name (required)
+
+Name of the subtest. This construction argument is required.
+
+=item send_to => $hub (optional)
+
+Hub to which the final subtest event should be sent. This must be an instance
+of L<Test2::Hub> or a subclass. If none is specified then the current top hub
+will be used.
+
+=item trace => $trace (optional)
+
+File/Line to which errors should be attributed. This must be an instance of
+L<Test2::Util::Trace>. If none is specified then the file/line where the
+constructor was called will be used.
+
+=item hub => $hub (optional)
+
+Use this to specify a hub the subtest should use. By default a new hub is
+generated. This must be an instance of L<Test2::AsyncSubtest::Hub>.
+
+=back
+
+=head1 METHODS
+
+=head2 SIMPLE ACCESSORS
+
+=over 4
+
+=item $bool = $ast->active
+
+True if the subtest is active. The subtest is active if its hub appears in the
+global hub stack. This is true when C<< $ast->run(...) >> us running.
+
+=item $arrayref = $ast->children
+
+Get an arrayref of child processes/threads. Numerical items are PIDs, blessed
+items are L<threads> instances.
+
+=item $arrayref = $ast->events
+
+Get an arrayref of events that have been sent to the subtests hub.
+
+=item $bool = $ast->finished
+
+True if C<finished()> has already been called.
+
+=item $hub = $ast->hub
+
+The hub created for the subtest.
+
+=item $int = $ast->id
+
+Attach/Detach counter. Used internally, not useful to users.
+
+=item $str = $ast->name
+
+Name of the subtest.
+
+=item $pid = $ast->pid
+
+PID in which the subtest was created.
+
+=item $tid = $ast->tid
+
+Thread ID in which the subtest was created.
+
+=item $hub = $ast->send_to
+
+Hub to which the final subtest event should be sent.
+
+=item $arrayref = $ast->stack
+
+Stack of async subtests at the time this one was created. This is mainly for
+internal use.
+
+=item $trace = $ast->trace
+
+L<Test2::Util::Trace> instance used for error reporting.
+
+=back
+
+=head2 INTERFACE
+
+=over 4
+
+=item $ast->attach($id)
+
+Attach a subtest in a child/process to the original.
+
+B<Note:> C<< my $id = $ast->cleave >> must have been called in the parent
+process/thread before the child was started, the id it returns must be used in
+the call to C<< $ast->attach($id) >>
+
+=item $id = $ast->cleave
+
+Prepare a slot for a child process/thread to attach. This must be called BEFORE
+the child process or thread is started. The ID returned is used by C<attach()>.
+
+This must only be called in the original process/thread.
+
+=item $ctx = $ast->context
+
+Get an L<Test2::API::Context> instance that can be used to send events to the
+context in which the hub was created. This is not a cononical context, you
+should not call C<< $ctx->release >> on it.
+
+=item $ast->detach
+
+Detach from the parent in a child process/thread. This should be called just
+before the child exits.
+
+=item $ast->finish
+
+Finish the subtest, wait on children, and send the final subtest event.
+
+This must only be called in the original process/thread.
+
+B<Note:> This calls C<< $ast->wait >>.
+
+=item $out = $ast->fork
+
+This is a slightly higher level interface to fork. Running it will fork your
+code in-place just like C<fork()>. It will return a pid in the parent, and an
+L<Scope::Guard> instance in the child. An exception will be thrown if fork
+fails.
+
+It is recomended that you use C<< $ast->run_fork(sub { ... }) >> instead.
+
+=item $bool = $ast->pending
+
+True if there are child processes, threads, or subtests that depend on this
+one.
+
+=item $bool = $ast->ready
+
+This is essentially C<< !$ast->pending >>.
+
+=item $ast->run(sub { ... })
+
+Run the provided codeblock inside the subtest. This will push the subtest hub
+onto the stack, run the code, then pop the hub off the stack.
+
+=item $pid = $ast->run_fork(sub { ... })
+
+Same as C<< $ast->run() >>, except that the codeblock is run in a child
+process.
+
+You do not need to directly call C<wait($pid)>, that will be done for you when
+C<< $ast->wait >>, or C<< $ast->finish >> are called.
+
+=item my $thr = $ast->run_thread(sub { ... });
+
+Same as C<< $ast->run() >>, except that the codeblock is run in a child
+thread.
+
+You do not need to directly call C<< $thr->join >>, that is done for you when
+C<< $ast->wait >>, or C<< $ast->finish >> are called.
+
+=item $passing = $ast->start
+
+Push the subtest hub onto the stack. Returns the current pass/fail status of
+the subtest.
+
+=item $ast->stop
+
+Pop the subtest hub off the stack. Returns the current pass/fail status of the
+subtest.
+
+=item $ast->wait
+
+Wait on all threads/processes that were started using C<< $ast->fork >>,
+C<< $ast->run_fork >>, or C<< $ast->run_thread >>.
+
+=back
+
+=head1 SOURCE
+
+The source code repository for Test2-AsyncSubtest can be found at
+F<http://github.com/Test-More/Test2-AsyncSubtest/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2015 Chad Granum E<lt>exodist7@gmail.comE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See F<http://dev.perl.org/licenses/>
+
+=cut
